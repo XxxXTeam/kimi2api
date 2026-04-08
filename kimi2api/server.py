@@ -11,7 +11,21 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .client import ChatCompletion, ChatCompletionChunk, Kimi2API, KimiAPIError
 
 SERVER_NAME = "Kimi2API"
-DEFAULT_MODELS = ["kimi-k2.5", "kimi-k2", "kimi-thinking", "kimi-search"]
+DEFAULT_BASE_MODEL = "kimi-k2.5"
+BASE_MODELS = ["kimi-k2.5", "kimi-k2"]
+DEFAULT_MODELS = [
+    "kimi-k2.5",
+    "kimi-k2.5-thinking",
+    "kimi-k2.5-search",
+    "kimi-k2.5-thinking-search",
+    "kimi-k2",
+    "kimi-k2-thinking",
+    "kimi-k2-search",
+    "kimi-k2-thinking-search",
+    "kimi-thinking",
+    "kimi-search",
+    "kimi-thinking-search",
+]
 
 
 def _json_error(message: str, error_type: str, code: int) -> JSONResponse:
@@ -41,8 +55,54 @@ def _normalize_messages(
     return [{"role": "user", "content": str(prompt)}]
 
 
-def _resolve_model(request_model: Optional[str]) -> str:
-    return request_model or os.getenv("MODEL", "kimi-k2.5")
+def _parse_model_alias(model: str) -> Dict[str, Any]:
+    normalized_model = (model or DEFAULT_BASE_MODEL).strip().lower()
+    enable_thinking = False
+    enable_web_search = False
+
+    alias_map = {
+        "kimi-thinking": (DEFAULT_BASE_MODEL, True, False),
+        "kimi-search": (DEFAULT_BASE_MODEL, False, True),
+        "kimi-thinking-search": (DEFAULT_BASE_MODEL, True, True),
+        "kimi-search-thinking": (DEFAULT_BASE_MODEL, True, True),
+    }
+    if normalized_model in alias_map:
+        base_model, enable_thinking, enable_web_search = alias_map[normalized_model]
+        return {
+            "request_model": normalized_model,
+            "base_model": base_model,
+            "enable_thinking": enable_thinking,
+            "enable_web_search": enable_web_search,
+        }
+
+    model_parts = [part for part in normalized_model.split("-") if part]
+    feature_parts = {"thinking", "think", "reasoning", "search"}
+    suffixes: List[str] = []
+    while model_parts and model_parts[-1] in feature_parts:
+        suffixes.append(model_parts.pop())
+
+    base_model = "-".join(model_parts) if model_parts else DEFAULT_BASE_MODEL
+    if base_model not in BASE_MODELS:
+        base_model = normalized_model
+        suffixes = []
+
+    for suffix in suffixes:
+        if suffix in {"thinking", "think", "reasoning"}:
+            enable_thinking = True
+        if suffix == "search":
+            enable_web_search = True
+
+    return {
+        "request_model": normalized_model,
+        "base_model": base_model,
+        "enable_thinking": enable_thinking,
+        "enable_web_search": enable_web_search,
+    }
+
+
+def _resolve_model(request_model: Optional[str]) -> Dict[str, Any]:
+    raw_model = request_model or os.getenv("MODEL", DEFAULT_BASE_MODEL)
+    return _parse_model_alias(raw_model)
 
 
 def _extract_conversation_id(payload: Dict[str, Any]) -> Optional[str]:
@@ -61,8 +121,7 @@ def _extract_conversation_id(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _extract_features(model: str, payload: Dict[str, Any]) -> Dict[str, bool]:
-    model_lower = model.lower()
+def _extract_features(model_info: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
     enable_thinking = bool(payload.get("enable_thinking") or payload.get("reasoning"))
     enable_web_search = bool(
         payload.get("enable_web_search")
@@ -70,12 +129,14 @@ def _extract_features(model: str, payload: Dict[str, Any]) -> Dict[str, bool]:
         or payload.get("search")
     )
 
-    if not enable_thinking and ("think" in model_lower or "reasoning" in model_lower):
+    if model_info.get("enable_thinking"):
         enable_thinking = True
-    if not enable_web_search and "search" in model_lower:
+    if model_info.get("enable_web_search"):
         enable_web_search = True
 
     return {
+        "model": model_info["base_model"],
+        "request_model": model_info["request_model"],
         "enable_thinking": enable_thinking,
         "enable_web_search": enable_web_search,
     }
@@ -189,13 +250,14 @@ def _chat_to_responses_api_dict(response: Dict[str, Any]) -> Dict[str, Any]:
 
 async def _stream_chat_chunks(
     stream: AsyncIterator[ChatCompletionChunk],
+    response_model: str,
 ) -> AsyncIterator[str]:
     async for chunk in stream:
         payload = {
             "id": chunk.id,
             "object": chunk.object,
             "created": chunk.created,
-            "model": chunk.model,
+            "model": response_model,
             "choices": chunk.choices,
             "system_fingerprint": "fp_kimi2api",
         }
@@ -238,6 +300,7 @@ async def _stream_responses_chunks(
 async def _create_streaming_chat_response(
     *,
     model: str,
+    response_model: str,
     messages: List[Dict[str, Any]],
     conversation_id: Optional[str],
     enable_thinking: bool,
@@ -253,7 +316,7 @@ async def _create_streaming_chat_response(
             enable_thinking=enable_thinking,
             enable_web_search=enable_web_search,
         )
-        async for chunk in _stream_chat_chunks(stream):
+        async for chunk in _stream_chat_chunks(stream, response_model):
             yield chunk
     finally:
         await client.close()
@@ -262,6 +325,7 @@ async def _create_streaming_chat_response(
 async def _create_streaming_responses_response(
     *,
     model: str,
+    response_model: str,
     messages: List[Dict[str, Any]],
     conversation_id: Optional[str],
     enable_thinking: bool,
@@ -387,15 +451,16 @@ def create_app() -> FastAPI:
                 detail={"message": "`messages` is required", "type": "invalid_request_error"},
             )
 
-        model = _resolve_model(payload.get("model"))
-        features = _extract_features(model, payload)
+        model_info = _resolve_model(payload.get("model"))
+        features = _extract_features(model_info, payload)
         conversation_id = _extract_conversation_id(payload)
         stream = bool(payload.get("stream", False))
 
         if stream:
             return StreamingResponse(
                 _create_streaming_chat_response(
-                    model=model,
+                    model=features["model"],
+                    response_model=features["request_model"],
                     messages=messages,
                     conversation_id=conversation_id,
                     enable_thinking=features["enable_thinking"],
@@ -411,13 +476,14 @@ def create_app() -> FastAPI:
 
         async with Kimi2API() as client:
             result = await client.chat.completions.create(
-                model=model,
+                model=features["model"],
                 messages=messages,
                 stream=False,
                 conversation_id=conversation_id,
                 enable_thinking=features["enable_thinking"],
                 enable_web_search=features["enable_web_search"],
             )
+            result.model = features["request_model"]
             return _chat_completion_to_dict(result)
 
     @app.post("/v1/completions", dependencies=[Depends(verify_api_key)])
@@ -430,18 +496,19 @@ def create_app() -> FastAPI:
                 detail={"message": "`prompt` is required", "type": "invalid_request_error"},
             )
 
-        model = _resolve_model(payload.get("model"))
-        features = _extract_features(model, payload)
+        model_info = _resolve_model(payload.get("model"))
+        features = _extract_features(model_info, payload)
         conversation_id = _extract_conversation_id(payload)
 
         async with Kimi2API() as client:
             result = await client.chat.completions.create(
-                model=model,
+                model=features["model"],
                 messages=messages,
                 conversation_id=conversation_id,
                 enable_thinking=features["enable_thinking"],
                 enable_web_search=features["enable_web_search"],
             )
+        result.model = features["request_model"]
 
         text = result.choices[0].message.content or ""
         return {
@@ -478,15 +545,16 @@ def create_app() -> FastAPI:
                 detail={"message": "`input` or `messages` is required", "type": "invalid_request_error"},
             )
 
-        model = _resolve_model(payload.get("model"))
-        features = _extract_features(model, payload)
+        model_info = _resolve_model(payload.get("model"))
+        features = _extract_features(model_info, payload)
         conversation_id = _extract_conversation_id(payload)
         stream = bool(payload.get("stream", False))
 
         if stream:
             return StreamingResponse(
                 _create_streaming_responses_response(
-                    model=model,
+                    model=features["model"],
+                    response_model=features["request_model"],
                     messages=messages,
                     conversation_id=conversation_id,
                     enable_thinking=features["enable_thinking"],
@@ -502,13 +570,14 @@ def create_app() -> FastAPI:
 
         async with Kimi2API() as client:
             result = await client.chat.completions.create(
-                model=model,
+                model=features["model"],
                 messages=messages,
                 stream=False,
                 conversation_id=conversation_id,
                 enable_thinking=features["enable_thinking"],
                 enable_web_search=features["enable_web_search"],
             )
+            result.model = features["request_model"]
             return _chat_to_responses_api_dict(_chat_completion_to_dict(result))
 
     @app.api_route(

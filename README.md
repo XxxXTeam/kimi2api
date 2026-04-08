@@ -46,6 +46,7 @@ PORT=8000
 - `KIMI_TOKEN` 是访问 Kimi 的真实 token
 - `OPENAI_API_KEY` 是你暴露给 OpenAI 客户端使用的服务端鉴权 key
 - 若未设置 `OPENAI_API_KEY`，服务端将不校验外部 Bearer Token
+- `MODEL` 可选，默认基础模型为 `kimi-k2.5`
 
 ## 启动服务
 
@@ -79,6 +80,17 @@ resp = client.chat.completions.create(
 
 print(resp.choices[0].message.content)
 ```
+
+## 模型别名
+
+- `kimi-k2.5` / `kimi-k2`：默认不带思考、不带搜索
+- `kimi-k2.5-thinking` / `kimi-k2-thinking`：开启思考
+- `kimi-k2.5-search` / `kimi-k2-search`：开启搜索
+- `kimi-k2.5-thinking-search` / `kimi-k2.5-search-thinking`：同时开启思考和搜索
+- `kimi-k2-thinking-search` / `kimi-k2-search-thinking`：同时开启思考和搜索
+- `kimi-thinking` / `kimi-search`：兼容旧别名，默认落到 `kimi-k2.5`
+- `kimi-thinking-search` / `kimi-search-thinking`：兼容旧组合别名，默认落到 `kimi-k2.5`
+- 也支持继续通过请求字段显式控制：`enable_thinking`、`reasoning`、`enable_web_search`、`web_search`、`search`
 
 ## curl 示例
 
